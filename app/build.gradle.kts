@@ -37,4 +37,7 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.0")
+    
+    // Live Cloud Network Sync for Phone A & Phone B
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
