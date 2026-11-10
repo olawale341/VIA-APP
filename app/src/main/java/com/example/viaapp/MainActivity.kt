@@ -10,6 +10,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -18,13 +19,17 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Phone
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
@@ -36,49 +41,118 @@ val ViaChatBackground = Color(0xFFEFE7DE)
 val ViaOutgoingBubble = Color(0xFFD9FDD3)
 
 data class ViaContact(val name: String, val phoneNumber: String)
-data class ViaMessage(val senderPhone: String, val text: String)
+data class ViaMessage(val senderPhone: String, val recipientPhone: String, val text: String, val timestamp: Long)
 
 class ViaViewModel : ViewModel() {
     var screen by mutableStateOf("LOGIN")
+    var inputName by mutableStateOf("")
     var inputPhone by mutableStateOf("")
     var inputPassword by mutableStateOf("")
     var generatedOtp by mutableStateOf("")
     var enteredOtp by mutableStateOf("")
     var myPhone by mutableStateOf("")
+    var myName by mutableStateOf("")
+    var errorMessage by mutableStateOf<String?>(null)
 
-    val registeredUsers = mutableStateMapOf(
-        "08012345678" to "Brother John",
-        "09087654321" to "Musa Repairs"
+    // Registered database: phoneNumber -> Pair(Name, 6-digit Password)
+    val registeredAccounts = mutableStateMapOf(
+        "08012345678" to Pair("Brother John", "123456"),
+        "09087654321" to Pair("Musa Repairs", "654321")
     )
 
     val myContacts = mutableStateListOf<ViaContact>()
-    val messages = mutableStateListOf<ViaMessage>()
+    val allMessages = mutableStateListOf<ViaMessage>()
     var activeContact by mutableStateOf<ViaContact?>(null)
 
-    fun sendOtp() {
-        if (inputPhone.length >= 10 && inputPassword.isNotBlank()) {
-            generatedOtp = (100000..999999).random().toString()
-            screen = "OTP"
+    fun registerOrLogin() {
+        val cleanPhone = inputPhone.trim()
+        val cleanName = inputName.trim()
+        val cleanPass = inputPassword.trim()
+
+        if (cleanName.isBlank()) {
+            errorMessage = "Please enter your username"
+            return
         }
+        if (cleanPhone.length < 10) {
+            errorMessage = "Please enter a valid phone number"
+            return
+        }
+        if (cleanPass.length != 6 || !cleanPass.all { it.isDigit() }) {
+            errorMessage = "Password must be exactly 6 digits"
+            return
+        }
+
+        // ONE REGISTER PER ACCOUNT CHECK
+        if (registeredAccounts.containsKey(cleanPhone)) {
+            val existing = registeredAccounts[cleanPhone]!!
+            if (existing.second == cleanPass) {
+                // Legitimate login for existing user
+                myPhone = cleanPhone
+                myName = existing.first
+                screen = "CHATS"
+                errorMessage = null
+                return
+            } else {
+                errorMessage = "Number already registered with a different password."
+                return
+            }
+        }
+
+        // Fresh Registration: Generate instant 6-digit verification code
+        generatedOtp = (100000..999999).random().toString()
+        errorMessage = null
+        screen = "OTP"
     }
 
     fun verify() {
-        if (enteredOtp == generatedOtp) {
-            myPhone = inputPhone.trim()
-            registeredUsers[myPhone] = "Me"
+        if (enteredOtp.trim() == generatedOtp) {
+            val cleanPhone = inputPhone.trim()
+            val cleanName = inputName.trim()
+            val cleanPass = inputPassword.trim()
+
+            myPhone = cleanPhone
+            myName = cleanName
+            registeredAccounts[cleanPhone] = Pair(cleanName, cleanPass)
             screen = "CHATS"
+            errorMessage = null
+        } else {
+            errorMessage = "Invalid 6-digit confirmation code."
         }
     }
 
     fun addContact(name: String, phone: String, onNotFound: () -> Unit) {
         val clean = phone.trim()
-        if (registeredUsers.containsKey(clean)) {
-            val contactName = if (name.isNotBlank()) name else registeredUsers[clean] ?: clean
+        if (registeredAccounts.containsKey(clean)) {
+            val registeredName = registeredAccounts[clean]!!.first
+            val contactName = if (name.isNotBlank()) name.trim() else registeredName
             if (myContacts.none { it.phoneNumber == clean }) {
                 myContacts.add(ViaContact(contactName, clean))
             }
         } else {
             onNotFound()
+        }
+    }
+
+    fun sendMessage(txt: String) {
+        val recipient = activeContact?.phoneNumber ?: return
+        if (txt.isNotBlank()) {
+            allMessages.add(
+                ViaMessage(
+                    senderPhone = myPhone,
+                    recipientPhone = recipient,
+                    text = txt.trim(),
+                    timestamp = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    // Filters messages strictly between You and the Active Chat Contact
+    fun getMessagesForActiveContact(): List<ViaMessage> {
+        val recipient = activeContact?.phoneNumber ?: return emptyList()
+        return allMessages.filter {
+            (it.senderPhone == myPhone && it.recipientPhone == recipient) ||
+            (it.senderPhone == recipient && it.recipientPhone == myPhone)
         }
     }
 }
@@ -102,6 +176,8 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun LoginView(vm: ViaViewModel) {
+    var passwordVisible by remember { mutableStateOf(false) }
+
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -110,32 +186,61 @@ fun LoginView(vm: ViaViewModel) {
         Box(modifier = Modifier.size(70.dp).background(ViaTeal, CircleShape), contentAlignment = Alignment.Center) {
             Icon(Icons.Default.Chat, contentDescription = null, tint = Color.White, modifier = Modifier.size(36.dp))
         }
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
         Text("VIA APP", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = ViaDarkGreen)
+        Text("Connect freely by phone number", fontSize = 13.sp, color = Color.Gray)
         Spacer(modifier = Modifier.height(24.dp))
+
+        // Username Field
+        OutlinedTextField(
+            value = vm.inputName,
+            onValueChange = { vm.inputName = it },
+            label = { Text("Username") },
+            leadingIcon = { Icon(Icons.Default.Person, null) },
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Phone Number Field
         OutlinedTextField(
             value = vm.inputPhone,
             onValueChange = { vm.inputPhone = it },
             label = { Text("Phone Number") },
             leadingIcon = { Icon(Icons.Default.Phone, null) },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
             modifier = Modifier.fillMaxWidth()
         )
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // 6-Digit Password with See/Hide Toggle
         OutlinedTextField(
             value = vm.inputPassword,
-            onValueChange = { vm.inputPassword = it },
-            label = { Text("Password") },
+            onValueChange = { if (it.length <= 6) vm.inputPassword = it },
+            label = { Text("6-Digit Password") },
             leadingIcon = { Icon(Icons.Default.Lock, null) },
-            visualTransformation = PasswordVisualTransformation(),
+            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+            trailingIcon = {
+                val image = if (passwordVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff
+                IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                    Icon(image, contentDescription = if (passwordVisible) "Hide password" else "Show password")
+                }
+            },
             modifier = Modifier.fillMaxWidth()
         )
+
+        if (vm.errorMessage != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(vm.errorMessage!!, color = Color.Red, fontSize = 12.sp)
+        }
+
         Spacer(modifier = Modifier.height(20.dp))
         Button(
-            onClick = { vm.sendOtp() },
+            onClick = { vm.registerOrLogin() },
             colors = ButtonDefaults.buttonColors(containerColor = ViaTeal),
             modifier = Modifier.fillMaxWidth().height(48.dp)
         ) {
-            Text("Next (Get 6-Digit Code)")
+            Text("Next / Sign In")
         }
     }
 }
@@ -147,14 +252,30 @@ fun OtpView(vm: ViaViewModel) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("Your 6-Digit Code:", fontSize = 16.sp, color = Color.Gray)
+        Text("Confirm Registration", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        Spacer(modifier = Modifier.height(6.dp))
+        Text("Your 6-Digit confirmation code:", fontSize = 14.sp, color = Color.Gray)
+
         Card(colors = CardDefaults.cardColors(containerColor = ViaOutgoingBubble), modifier = Modifier.padding(16.dp)) {
             Text(vm.generatedOtp, fontSize = 34.sp, fontWeight = FontWeight.Bold, color = ViaDarkGreen, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
         }
-        OutlinedTextField(value = vm.enteredOtp, onValueChange = { vm.enteredOtp = it }, label = { Text("Enter 6-Digit Code") }, modifier = Modifier.fillMaxWidth())
+
+        OutlinedTextField(
+            value = vm.enteredOtp,
+            onValueChange = { if (it.length <= 6) vm.enteredOtp = it },
+            label = { Text("Enter 6-Digit Code") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        if (vm.errorMessage != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(vm.errorMessage!!, color = Color.Red, fontSize = 12.sp)
+        }
+
         Spacer(modifier = Modifier.height(20.dp))
         Button(onClick = { vm.verify() }, colors = ButtonDefaults.buttonColors(containerColor = ViaTeal), modifier = Modifier.fillMaxWidth().height(48.dp)) {
-            Text("Verify & Enter")
+            Text("Verify & Enter VIA")
         }
     }
 }
@@ -170,7 +291,7 @@ fun ChatsView(vm: ViaViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("VIA APP", fontWeight = FontWeight.Bold) },
+                title = { Text("VIA APP (${vm.myName})", fontWeight = FontWeight.Bold) },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = ViaDarkGreen, titleContentColor = Color.White)
             )
         },
@@ -183,7 +304,7 @@ fun ChatsView(vm: ViaViewModel) {
         Column(modifier = Modifier.fillMaxSize().padding(pad)) {
             if (vm.myContacts.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("No contacts yet.\nTap + to add a registered phone number!", color = Color.Gray)
+                    Text("No chats yet.\nTap + to add a registered phone number!", color = Color.Gray)
                 }
             } else {
                 LazyColumn {
@@ -214,9 +335,15 @@ fun ChatsView(vm: ViaViewModel) {
             title = { Text("Add User") },
             text = {
                 Column {
-                    OutlinedTextField(value = addName, onValueChange = { addName = it }, label = { Text("Name") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = addName, onValueChange = { addName = it }, label = { Text("Contact Name") }, modifier = Modifier.fillMaxWidth())
                     Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(value = addPhone, onValueChange = { addPhone = it }, label = { Text("Phone Number") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(
+                        value = addPhone,
+                        onValueChange = { addPhone = it },
+                        label = { Text("Phone Number") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
             },
             confirmButton = {
@@ -228,9 +355,7 @@ fun ChatsView(vm: ViaViewModel) {
                         addPhone = ""
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = ViaTeal)
-                ) {
-                    Text("Add")
-                }
+                ) { Text("Add") }
             }
         )
     }
@@ -240,11 +365,7 @@ fun ChatsView(vm: ViaViewModel) {
             onDismissRequest = { showAlert = false },
             title = { Text("User Not Found") },
             text = { Text("User not in the VIA APP.\nThis phone number has not registered yet.") },
-            confirmButton = {
-                Button(onClick = { showAlert = false }, colors = ButtonDefaults.buttonColors(containerColor = ViaDarkGreen)) {
-                    Text("OK")
-                }
-            }
+            confirmButton = { Button(onClick = { showAlert = false }, colors = ButtonDefaults.buttonColors(containerColor = ViaDarkGreen)) { Text("OK") } }
         )
     }
 }
@@ -253,6 +374,8 @@ fun ChatsView(vm: ViaViewModel) {
 @Composable
 fun RoomView(vm: ViaViewModel) {
     var txt by remember { mutableStateOf("") }
+    val conversationMessages = vm.getMessagesForActiveContact()
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -268,7 +391,7 @@ fun RoomView(vm: ViaViewModel) {
     ) { pad ->
         Column(modifier = Modifier.fillMaxSize().padding(pad).background(ViaChatBackground)) {
             LazyColumn(modifier = Modifier.weight(1f).padding(12.dp)) {
-                items(vm.messages) { msg ->
+                items(conversationMessages) { msg ->
                     val isMe = msg.senderPhone == vm.myPhone
                     Box(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), contentAlignment = if (isMe) Alignment.CenterEnd else Alignment.CenterStart) {
                         Surface(color = if (isMe) ViaOutgoingBubble else Color.White, shape = RoundedCornerShape(8.dp), shadowElevation = 1.dp) {
@@ -278,12 +401,18 @@ fun RoomView(vm: ViaViewModel) {
                 }
             }
             Row(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(value = txt, onValueChange = { txt = it }, placeholder = { Text("Message") }, shape = RoundedCornerShape(24.dp), modifier = Modifier.weight(1f))
+                OutlinedTextField(
+                    value = txt,
+                    onValueChange = { txt = it },
+                    placeholder = { Text("Message") },
+                    shape = RoundedCornerShape(24.dp),
+                    modifier = Modifier.weight(1f)
+                )
                 Spacer(modifier = Modifier.width(6.dp))
                 IconButton(
                     onClick = {
                         if (txt.isNotBlank()) {
-                            vm.messages.add(ViaMessage(vm.myPhone, txt))
+                            vm.sendMessage(txt)
                             txt = ""
                         }
                     },
