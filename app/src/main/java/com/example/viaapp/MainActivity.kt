@@ -47,7 +47,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -81,12 +80,12 @@ class ViaViewModel : ViewModel() {
     private var pollingJob: Job? = null
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(12, TimeUnit.SECONDS)
         .build()
 
-    // Shared global live cloud store for VIA APP
-    private val BASE_URL = "https://kvdb.io/Vj9r8k2mQ7xL5t4pW3zB1N/"
+    // 100% Free Open Real-time Relay (Requires NO registration or API keys)
+    private val RELAY_URL = "https://ntfy.sh/"
 
     fun registerOrLogin() {
         val cleanPhone = inputPhone.trim()
@@ -104,27 +103,40 @@ class ViaViewModel : ViewModel() {
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val request = Request.Builder().url(BASE_URL + "user_" + cleanPhone).get().build()
-                val response = client.newCall(request).execute()
+                // Check if this phone number already registered on the relay
+                val req = Request.Builder().url(RELAY_URL + "via_usr_" + cleanPhone + "/json?poll=1").get().build()
+                val resp = client.newCall(req).execute()
+                val body = resp.body?.string() ?: ""
 
-                if (response.isSuccessful) {
-                    val body = response.body?.string() ?: ""
-                    val json = JSONObject(body)
-                    val savedPass = json.optString("pass")
+                var existingPass: String? = null
+                var existingName: String? = null
 
-                    withContext(Dispatchers.Main) {
-                        isChecking = false
-                        if (savedPass == cleanPass) {
+                // Parse ntfy response lines
+                for (line in body.lines()) {
+                    if (line.trim().isBlank()) continue
+                    try {
+                        val json = JSONObject(line)
+                        if (json.optString("event") == "message") {
+                            val payload = JSONObject(json.optString("message"))
+                            existingPass = payload.optString("pass")
+                            existingName = payload.optString("name")
+                        }
+                    } catch (e: Exception) { /* continue */ }
+                }
+
+                withContext(Dispatchers.Main) {
+                    isChecking = false
+                    if (existingPass != null) {
+                        // User already exists!
+                        if (existingPass == cleanPass) {
                             myPhone = cleanPhone
-                            myName = json.optString("name", cleanName)
+                            myName = existingName ?: cleanName
                             screen = "CHATS"
                         } else {
                             errorMessage = "Number already registered with another password."
                         }
-                    }
-                } else {
-                    withContext(Dispatchers.Main) {
-                        isChecking = false
+                    } else {
+                        // New user: proceed to 6-digit confirmation
                         generatedOtp = (100000..999999).random().toString()
                         screen = "OTP"
                     }
@@ -155,8 +167,8 @@ class ViaViewModel : ViewModel() {
                         put("phone", cleanPhone)
                         put("pass", cleanPass)
                     }
-                    val body = userObj.toString().toRequestBody("application/json".toMediaType())
-                    val saveReq = Request.Builder().url(BASE_URL + "user_" + cleanPhone).post(body).build()
+                    val body = userObj.toString().toRequestBody("text/plain".toMediaType())
+                    val saveReq = Request.Builder().url(RELAY_URL + "via_usr_" + cleanPhone).post(body).build()
                     client.newCall(saveReq).execute()
                 } catch (e: Exception) { e.printStackTrace() }
             }
@@ -164,10 +176,13 @@ class ViaViewModel : ViewModel() {
             screen = "CHATS"
             errorMessage = null
         } else {
-            errorMessage = "Invalid 6-digit code."
+            errorMessage = "Invalid 6-digit confirmation code."
         }
     }
 
+    /**
+     * SEARCH CLOUD DATABASE TO FIND PHONE B
+     */
     fun addContact(name: String, phone: String, onNotFound: () -> Unit) {
         val clean = phone.trim()
         if (clean.isBlank()) return
@@ -175,17 +190,27 @@ class ViaViewModel : ViewModel() {
         isChecking = true
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val req = Request.Builder().url(BASE_URL + "user_" + clean).get().build()
+                val req = Request.Builder().url(RELAY_URL + "via_usr_" + clean + "/json?poll=1").get().build()
                 val resp = client.newCall(req).execute()
+                val body = resp.body?.string() ?: ""
+
+                var foundName: String? = null
+
+                for (line in body.lines()) {
+                    if (line.trim().isBlank()) continue
+                    try {
+                        val json = JSONObject(line)
+                        if (json.optString("event") == "message") {
+                            val payload = JSONObject(json.optString("message"))
+                            foundName = payload.optString("name")
+                        }
+                    } catch (e: Exception) { /* continue */ }
+                }
 
                 withContext(Dispatchers.Main) {
                     isChecking = false
-                    if (resp.isSuccessful) {
-                        val body = resp.body?.string() ?: ""
-                        val json = JSONObject(body)
-                        val cloudName = json.optString("name", clean)
-                        val displayName = if (name.isNotBlank()) name.trim() else cloudName
-
+                    if (foundName != null) {
+                        val displayName = if (name.isNotBlank()) name.trim() else foundName
                         if (myContacts.none { it.phoneNumber == clean }) {
                             myContacts.add(ViaContact(displayName, clean))
                         }
@@ -220,7 +245,8 @@ class ViaViewModel : ViewModel() {
         val cleanTxt = txt.trim()
         if (cleanTxt.isBlank()) return
 
-        val newMsg = ViaMessage(myPhone, cleanTxt, System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        val newMsg = ViaMessage(myPhone, cleanTxt, now)
         conversationMessages.add(newMsg)
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -229,21 +255,12 @@ class ViaViewModel : ViewModel() {
                 val msgObj = JSONObject().apply {
                     put("sender", myPhone)
                     put("text", cleanTxt)
-                    put("time", System.currentTimeMillis())
+                    put("time", now)
                 }
 
-                val getReq = Request.Builder().url(BASE_URL + channelKey).get().build()
-                val getResp = client.newCall(getReq).execute()
-                val array = if (getResp.isSuccessful) {
-                    JSONArray(getResp.body?.string() ?: "[]")
-                } else {
-                    JSONArray()
-                }
-                array.put(msgObj)
-
-                val postBody = array.toString().toRequestBody("application/json".toMediaType())
-                val postReq = Request.Builder().url(BASE_URL + channelKey).post(postBody).build()
-                client.newCall(postReq).execute()
+                val body = msgObj.toString().toRequestBody("text/plain".toMediaType())
+                val req = Request.Builder().url(RELAY_URL + channelKey).post(body).build()
+                client.newCall(req).execute()
             } catch (e: Exception) { e.printStackTrace() }
         }
     }
@@ -256,30 +273,35 @@ class ViaViewModel : ViewModel() {
                 if (recipient != null && myPhone.isNotBlank()) {
                     try {
                         val channelKey = getChannelKey(myPhone, recipient)
-                        val req = Request.Builder().url(BASE_URL + channelKey).get().build()
+                        val req = Request.Builder().url(RELAY_URL + channelKey + "/json?poll=1").get().build()
                         val resp = client.newCall(req).execute()
+                        val body = resp.body?.string() ?: ""
 
-                        if (resp.isSuccessful) {
-                            val array = JSONArray(resp.body?.string() ?: "[]")
-                            val fetched = mutableListOf<ViaMessage>()
-                            for (i in 0 until array.length()) {
-                                val item = array.getJSONObject(i)
-                                fetched.add(
-                                    ViaMessage(
-                                        senderPhone = item.optString("sender"),
-                                        text = item.optString("text"),
-                                        timestamp = item.optLong("time")
+                        val fetched = mutableListOf<ViaMessage>()
+                        for (line in body.lines()) {
+                            if (line.trim().isBlank()) continue
+                            try {
+                                val json = JSONObject(line)
+                                if (json.optString("event") == "message") {
+                                    val payload = JSONObject(json.optString("message"))
+                                    fetched.add(
+                                        ViaMessage(
+                                            senderPhone = payload.optString("sender"),
+                                            text = payload.optString("text"),
+                                            timestamp = payload.optLong("time")
+                                        )
                                     )
-                                )
-                            }
-                            withContext(Dispatchers.Main) {
-                                if (fetched.size != conversationMessages.size) {
-                                    conversationMessages.clear()
-                                    conversationMessages.addAll(fetched)
                                 }
+                            } catch (e: Exception) { /* continue */ }
+                        }
+
+                        withContext(Dispatchers.Main) {
+                            if (fetched.size != conversationMessages.size) {
+                                conversationMessages.clear()
+                                conversationMessages.addAll(fetched)
                             }
                         }
-                    } catch (e: Exception) { /* retry safely */ }
+                    } catch (e: Exception) { /* retry */ }
                 }
                 delay(2000)
             }
@@ -287,7 +309,7 @@ class ViaViewModel : ViewModel() {
     }
 
     private fun getChannelKey(p1: String, p2: String): String {
-        return if (p1 < p2) "chat_${p1}_$p2" else "chat_${p2}_$p1"
+        return if (p1 < p2) "via_chat_${p1}_$p2" else "via_chat_${p2}_$p1"
     }
 }
 
@@ -509,7 +531,6 @@ fun RoomView(vm: ViaViewModel) {
     var txt by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
-    // Automatically scroll to the latest message at the bottom when sent or received
     LaunchedEffect(vm.conversationMessages.size) {
         if (vm.conversationMessages.isNotEmpty()) {
             listState.animateScrollToItem(vm.conversationMessages.size - 1)
@@ -531,7 +552,7 @@ fun RoomView(vm: ViaViewModel) {
     ) { pad ->
         Column(modifier = Modifier.fillMaxSize().padding(pad).background(ViaChatBackground)) {
 
-            // LazyColumn with Arrangement.Bottom: Keeps messages sitting at the BOTTOM like WhatsApp!
+            // Arrangement.Bottom keeps messages at the bottom like WhatsApp!
             LazyColumn(
                 state = listState,
                 verticalArrangement = Arrangement.Bottom,
