@@ -8,6 +8,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -15,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Chat
+import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PersonAdd
@@ -36,6 +38,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -46,6 +49,10 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 val ViaTeal = Color(0xFF00A884)
 val ViaDarkGreen = Color(0xFF008069)
@@ -71,13 +78,15 @@ class ViaViewModel : ViewModel() {
     val conversationMessages = mutableStateListOf<ViaMessage>()
     var activeContact by mutableStateOf<ViaContact?>(null)
 
-    private val client = OkHttpClient()
-    // Shared public live cloud store for VIA APP (Connects Phone A & Phone B)
-    private val BASE_URL = "https://kvdb.io/Vj9r8k2mQ7xL5t4pW3zB1N/"
+    private var pollingJob: Job? = null
 
-    init {
-        startMessagePolling()
-    }
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .build()
+
+    // Shared global live cloud store for VIA APP
+    private val BASE_URL = "https://kvdb.io/Vj9r8k2mQ7xL5t4pW3zB1N/"
 
     fun registerOrLogin() {
         val cleanPhone = inputPhone.trim()
@@ -95,7 +104,6 @@ class ViaViewModel : ViewModel() {
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Check if user already exists on the cloud
                 val request = Request.Builder().url(BASE_URL + "user_" + cleanPhone).get().build()
                 val response = client.newCall(request).execute()
 
@@ -111,11 +119,10 @@ class ViaViewModel : ViewModel() {
                             myName = json.optString("name", cleanName)
                             screen = "CHATS"
                         } else {
-                            errorMessage = "Number registered with another password."
+                            errorMessage = "Number already registered with another password."
                         }
                     }
                 } else {
-                    // New user: proceed to 6-digit confirmation
                     withContext(Dispatchers.Main) {
                         isChecking = false
                         generatedOtp = (100000..999999).random().toString()
@@ -125,7 +132,6 @@ class ViaViewModel : ViewModel() {
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     isChecking = false
-                    // Offline fallback
                     generatedOtp = (100000..999999).random().toString()
                     screen = "OTP"
                 }
@@ -162,9 +168,6 @@ class ViaViewModel : ViewModel() {
         }
     }
 
-    /**
-     * SEARCH CLOUD DATABASE TO FIND THE OTHER PHONE!
-     */
     fun addContact(name: String, phone: String, onNotFound: () -> Unit) {
         val clean = phone.trim()
         if (clean.isBlank()) return
@@ -199,6 +202,19 @@ class ViaViewModel : ViewModel() {
         }
     }
 
+    fun openChat(contact: ViaContact) {
+        activeContact = contact
+        conversationMessages.clear()
+        screen = "ROOM"
+        startLiveMessages()
+    }
+
+    fun closeChat() {
+        pollingJob?.cancel()
+        activeContact = null
+        screen = "CHATS"
+    }
+
     fun sendMessage(txt: String) {
         val recipient = activeContact?.phoneNumber ?: return
         val cleanTxt = txt.trim()
@@ -207,7 +223,6 @@ class ViaViewModel : ViewModel() {
         val newMsg = ViaMessage(myPhone, cleanTxt, System.currentTimeMillis())
         conversationMessages.add(newMsg)
 
-        // Upload to shared cloud channel so Phone B receives it!
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val channelKey = getChannelKey(myPhone, recipient)
@@ -217,7 +232,6 @@ class ViaViewModel : ViewModel() {
                     put("time", System.currentTimeMillis())
                 }
 
-                // Get existing messages
                 val getReq = Request.Builder().url(BASE_URL + channelKey).get().build()
                 val getResp = client.newCall(getReq).execute()
                 val array = if (getResp.isSuccessful) {
@@ -234,9 +248,9 @@ class ViaViewModel : ViewModel() {
         }
     }
 
-    // Auto-fetch new messages every 2 seconds
-    private fun startMessagePolling() {
-        viewModelScope.launch(Dispatchers.IO) {
+    private fun startLiveMessages() {
+        pollingJob?.cancel()
+        pollingJob = viewModelScope.launch(Dispatchers.IO) {
             while (isActive) {
                 val recipient = activeContact?.phoneNumber
                 if (recipient != null && myPhone.isNotBlank()) {
@@ -259,11 +273,13 @@ class ViaViewModel : ViewModel() {
                                 )
                             }
                             withContext(Dispatchers.Main) {
-                                conversationMessages.clear()
-                                conversationMessages.addAll(fetched)
+                                if (fetched.size != conversationMessages.size) {
+                                    conversationMessages.clear()
+                                    conversationMessages.addAll(fetched)
+                                }
                             }
                         }
-                    } catch (e: Exception) { /* retry */ }
+                    } catch (e: Exception) { /* retry safely */ }
                 }
                 delay(2000)
             }
@@ -356,7 +372,7 @@ fun LoginView(vm: ViaViewModel) {
             colors = ButtonDefaults.buttonColors(containerColor = ViaTeal),
             modifier = Modifier.fillMaxWidth().height(48.dp)
         ) {
-            Text(if (vm.isChecking) "Checking..." else "Next / Sign In")
+            Text(if (vm.isChecking) "Connecting..." else "Next / Sign In")
         }
     }
 }
@@ -434,8 +450,7 @@ fun ChatsView(vm: ViaViewModel) {
                                 }
                             },
                             modifier = Modifier.clickable {
-                                vm.activeContact = contact
-                                vm.screen = "ROOM"
+                                vm.openChat(contact)
                             }
                         )
                         HorizontalDivider(color = Color(0xFFF2F2F2))
@@ -487,17 +502,26 @@ fun ChatsView(vm: ViaViewModel) {
     }
 }
 
+// --- WHATSAPP-STYLE CHAT ROOM (MESSAGES AT THE BOTTOM) ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RoomView(vm: ViaViewModel) {
     var txt by remember { mutableStateOf("") }
+    val listState = rememberLazyListState()
+
+    // Automatically scroll to the latest message at the bottom when sent or received
+    LaunchedEffect(vm.conversationMessages.size) {
+        if (vm.conversationMessages.isNotEmpty()) {
+            listState.animateScrollToItem(vm.conversationMessages.size - 1)
+        }
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text(vm.activeContact?.name ?: "Chat") },
                 navigationIcon = {
-                    IconButton(onClick = { vm.screen = "CHATS" }) {
+                    IconButton(onClick = { vm.closeChat() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null, tint = Color.White)
                     }
                 },
@@ -506,22 +530,78 @@ fun RoomView(vm: ViaViewModel) {
         }
     ) { pad ->
         Column(modifier = Modifier.fillMaxSize().padding(pad).background(ViaChatBackground)) {
-            LazyColumn(modifier = Modifier.weight(1f).padding(12.dp)) {
+
+            // LazyColumn with Arrangement.Bottom: Keeps messages sitting at the BOTTOM like WhatsApp!
+            LazyColumn(
+                state = listState,
+                verticalArrangement = Arrangement.Bottom,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 6.dp)
+            ) {
                 items(vm.conversationMessages) { msg ->
                     val isMe = msg.senderPhone == vm.myPhone
-                    Box(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), contentAlignment = if (isMe) Alignment.CenterEnd else Alignment.CenterStart) {
-                        Surface(color = if (isMe) ViaOutgoingBubble else Color.White, shape = RoundedCornerShape(8.dp), shadowElevation = 1.dp) {
-                            Text(msg.text, modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp), fontSize = 15.sp)
+                    val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
+                    val formattedTime = timeFormat.format(Date(msg.timestamp))
+
+                    Box(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                        contentAlignment = if (isMe) Alignment.CenterEnd else Alignment.CenterStart
+                    ) {
+                        Surface(
+                            color = if (isMe) ViaOutgoingBubble else Color.White,
+                            shape = RoundedCornerShape(8.dp),
+                            shadowElevation = 1.dp
+                        ) {
+                            Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                                Text(
+                                    text = msg.text,
+                                    fontSize = 15.sp,
+                                    color = Color.Black
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Row(
+                                    modifier = Modifier.align(Alignment.End),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = formattedTime,
+                                        fontSize = 10.sp,
+                                        color = Color.Gray
+                                    )
+                                    if (isMe) {
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Icon(
+                                            Icons.Default.DoneAll,
+                                            contentDescription = null,
+                                            tint = ViaDarkGreen,
+                                            modifier = Modifier.size(13.dp)
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            Row(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+
+            // Bottom Typing Bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 OutlinedTextField(
                     value = txt,
                     onValueChange = { txt = it },
                     placeholder = { Text("Message") },
                     shape = RoundedCornerShape(24.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = Color.White,
+                        unfocusedContainerColor = Color.White
+                    ),
                     modifier = Modifier.weight(1f)
                 )
                 Spacer(modifier = Modifier.width(6.dp))
