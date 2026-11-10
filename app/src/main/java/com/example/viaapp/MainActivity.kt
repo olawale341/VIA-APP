@@ -33,7 +33,19 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
 
 val ViaTeal = Color(0xFF00A884)
 val ViaDarkGreen = Color(0xFF008069)
@@ -41,7 +53,7 @@ val ViaChatBackground = Color(0xFFEFE7DE)
 val ViaOutgoingBubble = Color(0xFFD9FDD3)
 
 data class ViaContact(val name: String, val phoneNumber: String)
-data class ViaMessage(val senderPhone: String, val recipientPhone: String, val text: String, val timestamp: Long)
+data class ViaMessage(val senderPhone: String, val text: String, val timestamp: Long)
 
 class ViaViewModel : ViewModel() {
     var screen by mutableStateOf("LOGIN")
@@ -53,55 +65,72 @@ class ViaViewModel : ViewModel() {
     var myPhone by mutableStateOf("")
     var myName by mutableStateOf("")
     var errorMessage by mutableStateOf<String?>(null)
-
-    // Registered database: phoneNumber -> Pair(Name, 6-digit Password)
-    val registeredAccounts = mutableStateMapOf(
-        "08012345678" to Pair("Brother John", "123456"),
-        "09087654321" to Pair("Musa Repairs", "654321")
-    )
+    var isChecking by mutableStateOf(false)
 
     val myContacts = mutableStateListOf<ViaContact>()
-    val allMessages = mutableStateListOf<ViaMessage>()
+    val conversationMessages = mutableStateListOf<ViaMessage>()
     var activeContact by mutableStateOf<ViaContact?>(null)
+
+    private val client = OkHttpClient()
+    // Shared public live cloud store for VIA APP (Connects Phone A & Phone B)
+    private val BASE_URL = "https://kvdb.io/Vj9r8k2mQ7xL5t4pW3zB1N/"
+
+    init {
+        startMessagePolling()
+    }
 
     fun registerOrLogin() {
         val cleanPhone = inputPhone.trim()
         val cleanName = inputName.trim()
         val cleanPass = inputPassword.trim()
 
-        if (cleanName.isBlank()) {
-            errorMessage = "Please enter your username"
-            return
-        }
-        if (cleanPhone.length < 10) {
-            errorMessage = "Please enter a valid phone number"
-            return
-        }
+        if (cleanName.isBlank()) { errorMessage = "Please enter your username"; return }
+        if (cleanPhone.length < 10) { errorMessage = "Please enter a valid phone number"; return }
         if (cleanPass.length != 6 || !cleanPass.all { it.isDigit() }) {
-            errorMessage = "Password must be exactly 6 digits"
-            return
+            errorMessage = "Password must be exactly 6 digits"; return
         }
 
-        // ONE REGISTER PER ACCOUNT CHECK
-        if (registeredAccounts.containsKey(cleanPhone)) {
-            val existing = registeredAccounts[cleanPhone]!!
-            if (existing.second == cleanPass) {
-                // Legitimate login for existing user
-                myPhone = cleanPhone
-                myName = existing.first
-                screen = "CHATS"
-                errorMessage = null
-                return
-            } else {
-                errorMessage = "Number already registered with a different password."
-                return
+        isChecking = true
+        errorMessage = null
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // Check if user already exists on the cloud
+                val request = Request.Builder().url(BASE_URL + "user_" + cleanPhone).get().build()
+                val response = client.newCall(request).execute()
+
+                if (response.isSuccessful) {
+                    val body = response.body?.string() ?: ""
+                    val json = JSONObject(body)
+                    val savedPass = json.optString("pass")
+
+                    withContext(Dispatchers.Main) {
+                        isChecking = false
+                        if (savedPass == cleanPass) {
+                            myPhone = cleanPhone
+                            myName = json.optString("name", cleanName)
+                            screen = "CHATS"
+                        } else {
+                            errorMessage = "Number registered with another password."
+                        }
+                    }
+                } else {
+                    // New user: proceed to 6-digit confirmation
+                    withContext(Dispatchers.Main) {
+                        isChecking = false
+                        generatedOtp = (100000..999999).random().toString()
+                        screen = "OTP"
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    isChecking = false
+                    // Offline fallback
+                    generatedOtp = (100000..999999).random().toString()
+                    screen = "OTP"
+                }
             }
         }
-
-        // Fresh Registration: Generate instant 6-digit verification code
-        generatedOtp = (100000..999999).random().toString()
-        errorMessage = null
-        screen = "OTP"
     }
 
     fun verify() {
@@ -112,48 +141,137 @@ class ViaViewModel : ViewModel() {
 
             myPhone = cleanPhone
             myName = cleanName
-            registeredAccounts[cleanPhone] = Pair(cleanName, cleanPass)
+
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val userObj = JSONObject().apply {
+                        put("name", cleanName)
+                        put("phone", cleanPhone)
+                        put("pass", cleanPass)
+                    }
+                    val body = userObj.toString().toRequestBody("application/json".toMediaType())
+                    val saveReq = Request.Builder().url(BASE_URL + "user_" + cleanPhone).post(body).build()
+                    client.newCall(saveReq).execute()
+                } catch (e: Exception) { e.printStackTrace() }
+            }
+
             screen = "CHATS"
             errorMessage = null
         } else {
-            errorMessage = "Invalid 6-digit confirmation code."
+            errorMessage = "Invalid 6-digit code."
         }
     }
 
+    /**
+     * SEARCH CLOUD DATABASE TO FIND THE OTHER PHONE!
+     */
     fun addContact(name: String, phone: String, onNotFound: () -> Unit) {
         val clean = phone.trim()
-        if (registeredAccounts.containsKey(clean)) {
-            val registeredName = registeredAccounts[clean]!!.first
-            val contactName = if (name.isNotBlank()) name.trim() else registeredName
-            if (myContacts.none { it.phoneNumber == clean }) {
-                myContacts.add(ViaContact(contactName, clean))
+        if (clean.isBlank()) return
+
+        isChecking = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val req = Request.Builder().url(BASE_URL + "user_" + clean).get().build()
+                val resp = client.newCall(req).execute()
+
+                withContext(Dispatchers.Main) {
+                    isChecking = false
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string() ?: ""
+                        val json = JSONObject(body)
+                        val cloudName = json.optString("name", clean)
+                        val displayName = if (name.isNotBlank()) name.trim() else cloudName
+
+                        if (myContacts.none { it.phoneNumber == clean }) {
+                            myContacts.add(ViaContact(displayName, clean))
+                        }
+                    } else {
+                        onNotFound()
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    isChecking = false
+                    onNotFound()
+                }
             }
-        } else {
-            onNotFound()
         }
     }
 
     fun sendMessage(txt: String) {
         val recipient = activeContact?.phoneNumber ?: return
-        if (txt.isNotBlank()) {
-            allMessages.add(
-                ViaMessage(
-                    senderPhone = myPhone,
-                    recipientPhone = recipient,
-                    text = txt.trim(),
-                    timestamp = System.currentTimeMillis()
-                )
-            )
+        val cleanTxt = txt.trim()
+        if (cleanTxt.isBlank()) return
+
+        val newMsg = ViaMessage(myPhone, cleanTxt, System.currentTimeMillis())
+        conversationMessages.add(newMsg)
+
+        // Upload to shared cloud channel so Phone B receives it!
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val channelKey = getChannelKey(myPhone, recipient)
+                val msgObj = JSONObject().apply {
+                    put("sender", myPhone)
+                    put("text", cleanTxt)
+                    put("time", System.currentTimeMillis())
+                }
+
+                // Get existing messages
+                val getReq = Request.Builder().url(BASE_URL + channelKey).get().build()
+                val getResp = client.newCall(getReq).execute()
+                val array = if (getResp.isSuccessful) {
+                    JSONArray(getResp.body?.string() ?: "[]")
+                } else {
+                    JSONArray()
+                }
+                array.put(msgObj)
+
+                val postBody = array.toString().toRequestBody("application/json".toMediaType())
+                val postReq = Request.Builder().url(BASE_URL + channelKey).post(postBody).build()
+                client.newCall(postReq).execute()
+            } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
-    // Filters messages strictly between You and the Active Chat Contact
-    fun getMessagesForActiveContact(): List<ViaMessage> {
-        val recipient = activeContact?.phoneNumber ?: return emptyList()
-        return allMessages.filter {
-            (it.senderPhone == myPhone && it.recipientPhone == recipient) ||
-            (it.senderPhone == recipient && it.recipientPhone == myPhone)
+    // Auto-fetch new messages every 2 seconds
+    private fun startMessagePolling() {
+        viewModelScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                val recipient = activeContact?.phoneNumber
+                if (recipient != null && myPhone.isNotBlank()) {
+                    try {
+                        val channelKey = getChannelKey(myPhone, recipient)
+                        val req = Request.Builder().url(BASE_URL + channelKey).get().build()
+                        val resp = client.newCall(req).execute()
+
+                        if (resp.isSuccessful) {
+                            val array = JSONArray(resp.body?.string() ?: "[]")
+                            val fetched = mutableListOf<ViaMessage>()
+                            for (i in 0 until array.length()) {
+                                val item = array.getJSONObject(i)
+                                fetched.add(
+                                    ViaMessage(
+                                        senderPhone = item.optString("sender"),
+                                        text = item.optString("text"),
+                                        timestamp = item.optLong("time")
+                                    )
+                                )
+                            }
+                            withContext(Dispatchers.Main) {
+                                conversationMessages.clear()
+                                conversationMessages.addAll(fetched)
+                            }
+                        }
+                    } catch (e: Exception) { /* retry */ }
+                }
+                delay(2000)
+            }
         }
+    }
+
+    private fun getChannelKey(p1: String, p2: String): String {
+        return if (p1 < p2) "chat_${p1}_$p2" else "chat_${p2}_$p1"
     }
 }
 
@@ -191,7 +309,6 @@ fun LoginView(vm: ViaViewModel) {
         Text("Connect freely by phone number", fontSize = 13.sp, color = Color.Gray)
         Spacer(modifier = Modifier.height(24.dp))
 
-        // Username Field
         OutlinedTextField(
             value = vm.inputName,
             onValueChange = { vm.inputName = it },
@@ -201,7 +318,6 @@ fun LoginView(vm: ViaViewModel) {
         )
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Phone Number Field
         OutlinedTextField(
             value = vm.inputPhone,
             onValueChange = { vm.inputPhone = it },
@@ -212,7 +328,6 @@ fun LoginView(vm: ViaViewModel) {
         )
         Spacer(modifier = Modifier.height(10.dp))
 
-        // 6-Digit Password with See/Hide Toggle
         OutlinedTextField(
             value = vm.inputPassword,
             onValueChange = { if (it.length <= 6) vm.inputPassword = it },
@@ -223,7 +338,7 @@ fun LoginView(vm: ViaViewModel) {
             trailingIcon = {
                 val image = if (passwordVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff
                 IconButton(onClick = { passwordVisible = !passwordVisible }) {
-                    Icon(image, contentDescription = if (passwordVisible) "Hide password" else "Show password")
+                    Icon(image, contentDescription = null)
                 }
             },
             modifier = Modifier.fillMaxWidth()
@@ -237,10 +352,11 @@ fun LoginView(vm: ViaViewModel) {
         Spacer(modifier = Modifier.height(20.dp))
         Button(
             onClick = { vm.registerOrLogin() },
+            enabled = !vm.isChecking,
             colors = ButtonDefaults.buttonColors(containerColor = ViaTeal),
             modifier = Modifier.fillMaxWidth().height(48.dp)
         ) {
-            Text("Next / Sign In")
+            Text(if (vm.isChecking) "Checking..." else "Next / Sign In")
         }
     }
 }
@@ -335,12 +451,13 @@ fun ChatsView(vm: ViaViewModel) {
             title = { Text("Add User") },
             text = {
                 Column {
-                    OutlinedTextField(value = addName, onValueChange = { addName = it }, label = { Text("Contact Name") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = addName, onValueChange = { addName = it }, label = { Text("Contact Name (Optional)") }, modifier = Modifier.fillMaxWidth())
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(
                         value = addPhone,
                         onValueChange = { addPhone = it },
                         label = { Text("Phone Number") },
+                        placeholder = { Text("e.g. 08012345678") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -355,7 +472,7 @@ fun ChatsView(vm: ViaViewModel) {
                         addPhone = ""
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = ViaTeal)
-                ) { Text("Add") }
+                ) { Text("Search & Add") }
             }
         )
     }
@@ -374,7 +491,6 @@ fun ChatsView(vm: ViaViewModel) {
 @Composable
 fun RoomView(vm: ViaViewModel) {
     var txt by remember { mutableStateOf("") }
-    val conversationMessages = vm.getMessagesForActiveContact()
 
     Scaffold(
         topBar = {
@@ -391,7 +507,7 @@ fun RoomView(vm: ViaViewModel) {
     ) { pad ->
         Column(modifier = Modifier.fillMaxSize().padding(pad).background(ViaChatBackground)) {
             LazyColumn(modifier = Modifier.weight(1f).padding(12.dp)) {
-                items(conversationMessages) { msg ->
+                items(vm.conversationMessages) { msg ->
                     val isMe = msg.senderPhone == vm.myPhone
                     Box(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), contentAlignment = if (isMe) Alignment.CenterEnd else Alignment.CenterStart) {
                         Surface(color = if (isMe) ViaOutgoingBubble else Color.White, shape = RoundedCornerShape(8.dp), shadowElevation = 1.dp) {
